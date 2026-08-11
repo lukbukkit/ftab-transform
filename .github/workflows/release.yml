@@ -1,0 +1,544 @@
+# Cut a new release of this Binary Ninja plugin.
+#
+# Why this workflow exists
+# ------------------------
+# Because we put versions in too many places that make them hard to manage. :-)
+#
+# This workflow it bumps plugin.json version, commits and pushes
+# that bump, and only then creates the tag and release -- pointing at the bump commit.
+#
+# It is also permissive in what it reads and strict in what it writes: it repairs
+# the manifest problems that quietly break ingestion (a trailing comma, a BOM,
+# legacy "plugin" nesting, a camelCase minimumBinaryNinjaVersion, a "v" prefix or
+# a bare major version) and writes plugin.json back in canonical form, reporting
+# everything it changed. The first run may therefore reformat the file; after
+# that it has converged and each release is a one-line diff.
+#
+# It keeps your versioning scheme: if plugin.json says 1.3, the next release is
+# 1.4, not 1.4.0. Only a bare major is coerced (7 -> 8.0), because the server's
+# own validator rejects a version with no minor component.
+#
+# How to use it
+# -------------
+# GitHub UI: Actions -> "Release" -> "Run workflow". Leave the version box empty
+# to bump the last number of the current version (1.3.5 -> 1.3.6), or type an
+# explicit version such as 2.0.0. From the CLI: `gh workflow run release.yml`
+# (optionally `-f version=2.0.0`).
+#
+# Copying this into your own plugin repo
+# --------------------------------------
+# It should work unmodified in any Binary Ninja plugin repo whose plugin.json
+# sits at the repository root. If yours lives in a subdirectory, change
+# PLUGIN_JSON below. Nothing here hardcodes a branch name, a repository name, or
+# a version scheme.
+
+name: Release
+
+on:
+  # Manual only -- releasing should always be a deliberate act, never a
+  # side effect of pushing code.
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "New version (leave blank to bump the last number, e.g. 1.3.5 -> 1.3.6)"
+        required: false
+        default: ""
+        type: string
+
+# The built-in GITHUB_TOKEN needs write access to push the bump commit, push the
+# tag, and create the release. No personal access token or third-party secret is
+# required. (Note that pushes made with GITHUB_TOKEN deliberately do not trigger
+# other workflows, so this cannot cause a release loop.)
+permissions:
+  contents: write
+
+# Never let two releases run at once; they would race on the same branch.
+concurrency:
+  group: release-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      # Path to the plugin manifest, relative to the repository root.
+      PLUGIN_JSON: plugin.json
+      # Derived from the repository, so this works whether your default branch
+      # is "master", "main", or anything else.
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+
+    steps:
+      # actions/checkout is GitHub's own action (the same trust domain as the
+      # runner itself), so a major-version tag is used rather than a SHA pin.
+      # Any genuinely third-party action should be pinned to a commit SHA.
+      - name: Check out the default branch
+        uses: actions/checkout@v4
+        with:
+          # Always release from the default branch, no matter which branch the
+          # workflow was dispatched from.
+          ref: ${{ github.event.repository.default_branch }}
+          # Full history and all tags: the validation below reads plugin.json out
+          # of every existing tag to make sure this version has not already been
+          # published.
+          fetch-depth: 0
+
+      # Everything that can go wrong is decided in this one step, and nothing is
+      # written to disk until every check has passed -- so a rejected release
+      # leaves the working tree exactly as it was.
+      - name: Normalize plugin.json and resolve the new version
+        id: version
+        env:
+          # Passed through the environment rather than interpolated into the
+          # script body, so a funny value can never become shell/python code.
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          # --- The rules the extension server actually applies ----------------
+          # A version has to satisfy BOTH of these to survive the trip.
+          #
+          # 1. extensions/types.py ParsedVersion._VERSION_REGEX -- how the server
+          #    derives major/minor/patch at ingest. Accepts "1", "v1.2.3", "1-2-3";
+          #    rejects "1.0.0-beta", "2023.1.1.4".
+          PARSE_RE = re.compile(r"^v?(?P<major>\d+)([.-](?P<minor>\d+))?([.-](?P<patch>\d+))?$")
+          #
+          # 2. extensions/models.py ExtensionVersion.version_string, validated by
+          #    extensions/validators.py semver_validator -- strict semver. Requires
+          #    MAJOR.MINOR at minimum, forbids a leading "v" and leading zeros.
+          #    (Caveat: ingestion uses objects.create(), which does not run Django
+          #    validators, so this is not enforced at ingest today -- but it is the
+          #    declared standard and the admin UI does enforce it. We write to it.)
+          SEMVER_RE = re.compile(
+              r"^(0|[1-9]\d*)\.(0|[1-9]\d*)(?:\.(0|[1-9]\d*))?"
+              r"(?:-(?:[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?"
+              r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$"
+          )
+          #
+          # The intersection of the two -- and therefore what we always WRITE --
+          # is MAJOR.MINOR[.PATCH] with no "v", no leading zeros and no suffix.
+          # We keep the author's granularity: a project versioning as 1.3 keeps
+          # releasing 1.4, 1.5, ... and is never silently promoted to 1.4.0. The
+          # only coercion is a bare major ("7"), which rule 2 rejects outright, so
+          # it gains a minor ("8.0").
+          #
+          # version_string is a CharField(max_length=16); a longer string fails at
+          # the database level.
+          MAX_VERSION_LENGTH = 16
+          # sources/models.py hard-fails ingestion when any of these is missing.
+          REQUIRED_FIELDS = ("name", "api", "description", "license", "version", "author")
+          # The canonical manifest format. There is no v3 in the server codebase.
+          PLUGIN_METADATA_VERSION = 2
+          # UTF-8 byte-order mark, as a character (some editors prepend one, and
+          # it makes the manifest unparseable for the server).
+          BOM = "\ufeff"
+
+          plugin_json = Path(os.environ.get("PLUGIN_JSON", "plugin.json"))
+          requested = os.environ.get("INPUT_VERSION", "").strip()
+
+          # Every repair we make, reported to the author at the end.
+          repairs = []
+
+
+          def fail(message):
+              # "::error::" makes the message show up as an annotation on the run.
+              print(f"::error::{message}")
+              sys.exit(1)
+
+
+          def repair(message, loud=False):
+              repairs.append(("warning" if loud else "notice", message))
+
+
+          def parse(version):
+              """(major, minor, patch), or None if the server could not parse it."""
+              match = PARSE_RE.fullmatch(str(version).strip())
+              if match is None:
+                  return None
+              parts = match.groupdict()
+              return (int(parts["major"]), int(parts["minor"] or 0), int(parts["patch"] or 0))
+
+
+          def strip_v(version):
+              return version[1:] if version[:1] in ("v", "V") else version
+
+
+          def components(version):
+              """How many components the author wrote: "1.3" -> 2, "1-3-5" -> 3."""
+              return len(re.split(r"[.-]", strip_v(str(version).strip())))
+
+
+          def canonical(version):
+              """Clean up a version WITHOUT changing how precise the author was.
+
+              Strips a leading "v", turns "-" separators into ".", drops leading
+              zeros -- but keeps the component count, because that is the author's
+              versioning scheme and not ours to change:
+
+                  1.3.6 -> 1.3.6      1.4  -> 1.4       (NOT 1.4.0)
+                  v1.4  -> 1.4        1.3-2 -> 1.3.2    01.4 -> 1.4
+
+              The single exception is a bare major, which semver_validator rejects,
+              so it gains a minor: "8" -> "8.0".
+              """
+              parts = parse(version)
+              if parts is None:
+                  return None
+              width = min(max(components(version), 2), 3)
+              return ".".join(str(part) for part in parts[:width])
+
+
+          def bump(version):
+              """Increment the last number the author actually wrote.
+
+              1.3.5 -> 1.3.6, 1.3 -> 1.4, 0.4 -> 0.5, 7 -> 8. The component count is
+              preserved here and by canonical(), so a two-component scheme keeps
+              releasing two-component versions.
+              """
+              pieces = re.split(r"([.-])", strip_v(version))
+              pieces[-1] = str(int(pieces[-1]) + 1)
+              return "".join(pieces)
+
+
+          def strip_trailing_commas(text):
+              """Remove ",]" / ",}" commas that sit outside of JSON strings.
+
+              Written as a tiny scanner rather than a regex so that a comma inside
+              a string (license text is full of prose) is never touched.
+              """
+              out = []
+              in_string = False
+              escaped = False
+              removed = 0
+              for index, char in enumerate(text):
+                  if in_string:
+                      out.append(char)
+                      if escaped:
+                          escaped = False
+                      elif char == "\\":
+                          escaped = True
+                      elif char == '"':
+                          in_string = False
+                      continue
+                  if char == '"':
+                      in_string = True
+                      out.append(char)
+                      continue
+                  if char == ",":
+                      lookahead = index + 1
+                      while lookahead < len(text) and text[lookahead].isspace():
+                          lookahead += 1
+                      if lookahead < len(text) and text[lookahead] in "}]":
+                          removed += 1
+                          continue  # drop this comma
+                  out.append(char)
+              return "".join(out), removed
+
+
+          def load_json(text):
+              """Parse permissively. Returns (document, list of repairs made).
+
+              Strict first -- a healthy manifest is never touched. Only when the
+              strict parse fails do we try the two breakages that are common in the
+              wild and that the server's own strict parser rejects outright: a
+              UTF-8 BOM and trailing commas.
+              """
+              try:
+                  return json.loads(text), []
+              except json.JSONDecodeError as exc:
+                  # Bind it to a name that outlives this block ("except ... as e"
+                  # unbinds e on the way out) so we can report the original error.
+                  strict_error = exc
+              fixes = []
+              cleaned = text
+              if cleaned.startswith(BOM):
+                  cleaned = cleaned.lstrip(BOM)
+                  fixes.append("removed a UTF-8 byte-order mark (BOM)")
+              cleaned, removed = strip_trailing_commas(cleaned)
+              if removed:
+                  fixes.append(f"removed {removed} trailing comma(s)")
+              try:
+                  return json.loads(cleaned), fixes
+              except json.JSONDecodeError as exc:
+                  raise ValueError(str(strict_error) if not fixes else str(exc))
+
+
+          def unnest(document):
+              """Legacy manifests wrap everything in a top-level "plugin" object.
+
+              The server reads document["plugin"] and ignores every sibling key
+              (sources/models.py), so un-nesting to the flat form is lossless with
+              respect to what actually gets ingested. Any siblings are named in the
+              report so their loss is never silent.
+              """
+              inner = document.get("plugin")
+              if not isinstance(inner, dict):
+                  return document, []
+              dropped = [key for key in document if key != "plugin"]
+              return inner, dropped
+
+
+          def git(*args):
+              """Run git, returning stdout, or None if the command failed."""
+              proc = subprocess.run(("git",) + args, capture_output=True, text=True)
+              return proc.stdout if proc.returncode == 0 else None
+
+
+          # --- Read (permissively) --------------------------------------------
+          if not plugin_json.is_file():
+              fail(f"{plugin_json} not found at the repository root. Set PLUGIN_JSON if it lives elsewhere.")
+          try:
+              text = plugin_json.read_text(encoding="utf-8")
+          except UnicodeDecodeError as exc:
+              fail(f"{plugin_json} is not valid UTF-8 ({exc}); the server cannot read it.")
+          try:
+              document, syntax_fixes = load_json(text)
+          except ValueError as exc:
+              fail(
+                  f"{plugin_json} is not valid JSON and could not be repaired: {exc}. "
+                  "The extension manager parses it with the same strict rules and would "
+                  "reject this release outright, so fix the manifest before releasing."
+              )
+          if not isinstance(document, dict):
+              fail(f"{plugin_json} must contain a JSON object.")
+          for message in syntax_fixes:
+              # Loud: the file on disk was genuinely broken and the server would
+              # have refused it.
+              repair(f"{message} -- the manifest was NOT valid JSON and the server would have rejected this release", loud=True)
+
+          manifest, dropped_siblings = unnest(document)
+          if manifest is not document:
+              repair('un-nested the legacy top-level "plugin" object into the flat canonical form')
+              if dropped_siblings:
+                  repair(
+                      "dropped top-level key(s) alongside \"plugin\" that the server already ignores: "
+                      + ", ".join(sorted(dropped_siblings)),
+                      loud=True,
+                  )
+
+          # The server accepts the camelCase spelling as a fallback
+          # (sources/models.py), but the canonical key is all-lowercase.
+          if "minimumBinaryNinjaVersion" in manifest:
+              duplicate = "minimumbinaryninjaversion" in manifest
+              rebuilt = {}
+              for key, value in manifest.items():
+                  if key == "minimumBinaryNinjaVersion":
+                      if duplicate:
+                          continue  # canonical key already present; drop the duplicate
+                      rebuilt["minimumbinaryninjaversion"] = value
+                  else:
+                      rebuilt[key] = value
+              manifest = rebuilt
+              if duplicate:
+                  repair(
+                      'dropped the duplicate "minimumBinaryNinjaVersion"; the canonical '
+                      '"minimumbinaryninjaversion" was already present and is the one the server prefers'
+                  )
+              else:
+                  repair('renamed "minimumBinaryNinjaVersion" to the canonical "minimumbinaryninjaversion"')
+
+          # --- Fail early on anything the server would refuse to ingest -------
+          missing = [field for field in REQUIRED_FIELDS if field not in manifest]
+          if missing:
+              fail(
+                  f"{plugin_json} is missing required field(s): {', '.join(missing)}. "
+                  "The extension manager refuses to ingest a plugin without them, so this "
+                  "release would never reach users."
+              )
+
+          current_raw = str(manifest["version"]).strip()
+          if not current_raw:
+              fail(f'{plugin_json} has an empty "version"; the extension manager requires one.')
+          current = parse(current_raw)
+
+          # --- What version are we going to? ----------------------------------
+          if requested:
+              new_raw = requested
+          else:
+              if current is None:
+                  fail(
+                      f'Cannot auto-increment: the current version "{current_raw}" is not a '
+                      "number the server can parse. Re-run this workflow with an explicit version."
+                  )
+              new_raw = bump(current_raw)
+
+          new_version = canonical(new_raw)
+
+          # --- Validate before writing anything -------------------------------
+          if new_version is None:
+              fail(
+                  f'"{new_raw}" is not a version the extension manager can parse. '
+                  "Use <major>, <major>.<minor>, or <major>.<minor>.<patch> (digits only, "
+                  "optional leading v) -- for example 1.4.0. Suffixes such as -beta, build "
+                  "metadata, and four-part versions are rejected by the server."
+              )
+          if not SEMVER_RE.fullmatch(new_version):
+              # Belt and braces: canonical() should always produce a semver-clean
+              # string, so this only fires if the rules above ever drift apart.
+              fail(f'"{new_version}" is not a valid semantic version for the extension manager.')
+          if len(new_version) > MAX_VERSION_LENGTH:
+              fail(
+                  f'Version "{new_version}" is {len(new_version)} characters; the server stores '
+                  f"at most {MAX_VERSION_LENGTH} and would fail to save the release."
+              )
+
+          new = parse(new_version)
+          if current is not None and new <= current:
+              fail(
+                  f'New version "{new_version}" is not greater than the current version '
+                  f'"{current_raw}" in {plugin_json}. Releases must move forward, and the '
+                  "extension manager skips a release whose version it has already seen."
+              )
+
+          # A tag that already exists means this version was almost certainly
+          # already released. Both naming conventions are checked because plugin
+          # repos have historically used "1.4.0" and "v1.4.0" interchangeably.
+          existing_tags = set((git("tag", "--list") or "").split())
+          for candidate in (new_version, f"v{new_version}"):
+              if candidate in existing_tags:
+                  fail(f'Tag "{candidate}" already exists; version {new_version} looks like it was already released.')
+
+          # Belt and braces: read plugin.json out of every existing tag (purely
+          # local -- no API calls -- because we cloned the full history) and make
+          # sure none of them already claimed this version. This catches the case
+          # where an old release used a differently named tag. Versions are compared
+          # numerically, so 1.4, 1.4.0 and v1.4 all count as the same.
+          clashes = []
+          for tag in sorted(existing_tags):
+              blob = git("show", f"{tag}:{plugin_json}")
+              if blob is None:
+                  continue  # tag predates plugin.json, or the file moved
+              try:
+                  old_document, _ = load_json(blob)
+                  old_manifest, _ = unnest(old_document)
+                  previous = str(old_manifest.get("version", "")).strip()
+              except (ValueError, AttributeError):
+                  continue
+              if previous and parse(previous) == new:
+                  clashes.append(f"{tag} (plugin.json version {previous})")
+          if clashes:
+              fail(
+                  f"Version {new_version} was already published by: {', '.join(clashes)}. "
+                  "The extension manager would silently skip this release; pick a higher version."
+              )
+
+          # --- Write (strictly canonical) -------------------------------------
+          if new_version != new_raw.strip():
+              repair(f'version "{new_raw.strip()}" written in canonical form as "{new_version}"')
+          manifest["version"] = new_version
+
+          if "pluginmetadataversion" not in manifest:
+              # Canonical manifests declare it, and it belongs at the top.
+              manifest = {"pluginmetadataversion": PLUGIN_METADATA_VERSION, **manifest}
+              repair(f'added the missing "pluginmetadataversion": {PLUGIN_METADATA_VERSION}')
+
+          # json preserves key order, so do NOT pass sort_keys -- the field order the
+          # author chose is kept. ensure_ascii=False keeps license and description
+          # text readable instead of escaping every non-ASCII character.
+          rendered = json.dumps(manifest, indent=2, ensure_ascii=False) + "\n"
+          plugin_json.write_text(rendered, encoding="utf-8")
+
+          # Read it back from disk and confirm we wrote what we meant to.
+          try:
+              written = json.loads(plugin_json.read_text(encoding="utf-8"))
+          except json.JSONDecodeError as exc:
+              fail(f"Writing {plugin_json} produced invalid JSON ({exc}).")
+          if str(written.get("version")) != new_version:
+              fail(f'Version is "{written.get("version")}" after the write, expected "{new_version}".')
+          for field in REQUIRED_FIELDS:
+              if field not in written:
+                  fail(f'Required field "{field}" disappeared while writing {plugin_json}.')
+
+          # --- Report ----------------------------------------------------------
+          print(f"Releasing {current_raw} -> {new_version}")
+          for level, message in repairs:
+              print(f"::{level}::{plugin_json}: {message}")
+
+          summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary_path:
+              with open(summary_path, "a") as summary:
+                  summary.write(f"### {plugin_json}: {current_raw} -> {new_version}\n\n")
+                  if repairs:
+                      summary.write("Normalized while releasing:\n\n")
+                      for level, message in repairs:
+                          marker = "**repaired**" if level == "warning" else "normalized"
+                          summary.write(f"- {marker}: {message}\n")
+                  else:
+                      summary.write("Already canonical; only the version changed.\n")
+                  summary.write("\n")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"version={new_version}\n")
+              # Tag naming is convention only -- the server never parses the tag.
+              # We use the bare version so the tag, the release title and
+              # plugin.json all read the same.
+              out.write(f"tag={new_version}\n")
+              out.write(f"previous={current_raw}\n")
+          PY
+          git --no-pager diff -- "$PLUGIN_JSON"
+
+      # ---------------------------------------------------------------------
+      # THE MOST IMPORTANT PART OF THIS WORKFLOW.
+      #
+      # The tag must point at the commit that CONTAINS the bumped plugin.json.
+      # The extension manager resolves the latest release to its tag, then reads
+      # plugin.json from that tag's commit. If we tagged the pre-bump commit, the
+      # server would read the OLD version, decide it already has it, and skip the
+      # release entirely -- with no error anywhere.
+      #
+      # Hence the order: commit the bump -> push it -> tag that commit -> push the
+      # tag -> create the release from that tag. Never reorder these.
+      # ---------------------------------------------------------------------
+      - name: Commit and push the version bump
+        env:
+          NEW_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- "$PLUGIN_JSON"
+          git commit -m "Version $NEW_VERSION"
+          # Push before tagging: if someone else pushed while this ran, this fails
+          # here and we stop without having created a misleading tag or release.
+          # (A protected default branch will also reject this push -- if yours is
+          # protected, allow the github-actions bot to push to it.)
+          git push origin "HEAD:refs/heads/$DEFAULT_BRANCH"
+
+      - name: Tag the bump commit and publish the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NEW_VERSION: ${{ steps.version.outputs.version }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # HEAD is the bump commit we just pushed -- this is the tag/commit
+          # relationship the extension manager depends on.
+          git tag -a "$TAG" -m "Version $NEW_VERSION"
+          git push origin "refs/tags/$TAG"
+
+          # --verify-tag makes gh refuse to invent a tag of its own: the release
+          # must attach to the tag we created above, or fail loudly.
+          # --latest is explicit because the extension manager only ever looks at
+          # /releases/latest.
+          # The release body becomes the changelog shown in the extension manager,
+          # so replace --generate-notes with --notes "..." if you would rather
+          # write it yourself.
+          gh release create "$TAG" \
+            --title "$NEW_VERSION" \
+            --verify-tag \
+            --latest \
+            --generate-notes
+
+          {
+            echo "### Released $NEW_VERSION"
+            echo ""
+            echo "- plugin.json version (the only version the extension manager reads): \`$NEW_VERSION\`"
+            echo "- tag: \`$TAG\` (naming is convention only)"
+            echo "- $(gh release view "$TAG" --json url --jq .url)"
+          } >> "$GITHUB_STEP_SUMMARY"
