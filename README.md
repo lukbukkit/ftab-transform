@@ -10,9 +10,9 @@ Note that originally we recommended specifying the contents of this entire file 
 
 ## Cutting a release
 
-This repo includes a [release workflow](./.github/workflows/release.yml) that you are welcome to copy into your own plugin repo (it works unmodified as long as `plugin.json` is at the repository root).
+This repo includes a [release workflow](./.github/workflows/release.yml) that you are welcome to copy into your own plugin repo (it works unmodified as long as `plugin.json` is at the repository root). It is a thin wrapper around [`Vector35/plugin_actions`](https://github.com/Vector35/plugin_actions), which is where the release machinery actually lives and where its [full documentation](https://github.com/Vector35/plugin_actions#readme) is — so improvements reach you by moving the `@v1` tag, not by re-copying the file.
 
-To release: **Actions → Release → Run workflow**. Leave the version box empty to bump the last number of the current version (1.3.5 → 1.3.6), or type an explicit version such as `2.0.0`. From the command line, `gh workflow run release.yml` (add `-f version=2.0.0` for an explicit version).
+To release: **Actions → Release → Run workflow**. Leave the version box empty to bump the last number of the current version (1.3.5 → 1.3.6), or type an explicit version such as `2.0.0`. From the command line, `gh workflow run release.yml` (add `-f version=2.0.0` for an explicit version). Add `-f dry-run=true` to see what a release would do without publishing anything.
 
 The workflow bumps `version` in `plugin.json`, commits and pushes that change to the default branch, tags **that** commit, and creates the release from the tag — in that order. This matters because [extensions.binary.ninja](https://extensions.binary.ninja) reads `plugin.json` from the commit your latest release's tag points at, and the `version` field in that file is the only version it looks at. The tag name and release title are never parsed. If that version string matches a version the server already has, your release is silently skipped and the code never reaches users. The workflow refuses to release a version that is malformed, already tagged, already published, or not greater than the current one.
 
