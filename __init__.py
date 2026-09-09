@@ -12,14 +12,6 @@ class FtabError(Exception):
     pass
 
 
-T = TypeVar('T')
-
-
-def read_err(v: Optional[T]) -> T:
-    if v is None:
-        raise FtabError(f'Cannot read value of {type(v).__name__} because is None')
-
-
 @dataclass
 class FtabHeader:
     LENGTH: ClassVar[int] = 0x30
@@ -53,10 +45,10 @@ class FtabHeader:
 
     def valid_or_raise(self):
         if self.magic != b'rkosftab':
-            raise FtabError(f'Invalid Ftab header magic')
+            raise FtabError(f'Invalid FTAB header magic')
 
         if self.version != 0:
-            raise FtabError(f'Unspported Ftab header version')
+            raise FtabError(f'Unsupported FTAB header version')
 
 
 @dataclass
@@ -74,7 +66,7 @@ class FtabEntry:
             self.offset,
             self.length,
             self.unk_0,
-        ) = struct.unpack("4sIII", data)
+        ) = struct.unpack("<4sIII", data)
 
     def read_bytes(self, data: bytes) -> bytes:
         if len(data) < self.offset + self.length:
@@ -109,8 +101,8 @@ class CompressedEntry:
             self.magic
         ) = struct.unpack("<III4s", data[:self.LENGTH])
 
-    def valid_lzfse(self):
-        return self.magic == b'bvx2'
+    def valid_lzfse(self, data: bytes) -> bool:
+        return len(data) >= self.compressed_size + self.LENGTH_CUT and self.magic == b'bvx2'
 
 
 
@@ -119,7 +111,7 @@ class FtabParser:
     @staticmethod
     def parse_bytes(data: bytes) -> tuple[FtabHeader, list[FtabEntry]]:
         if len(data) < FtabHeader.LENGTH:
-            raise FtabError(f'BinaryView has fewer bytes than (0x20) -> No complete FTAB header')
+            raise FtabError(f'BinaryView has fewer bytes than ({FtabHeader.LENGTH:#x}) -> No complete FTAB header')
 
         header = FtabHeader(data)
         header.valid_or_raise()
@@ -138,7 +130,7 @@ class FtabParser:
     @staticmethod
     def parse_view(bv: BinaryView) -> tuple[FtabHeader, list[FtabEntry]]:
         if bv.length < FtabHeader.LENGTH:
-            raise FtabError(f'BinaryView has fewer bytes than (0x20) -> No complete FTAB header')
+            raise FtabError(f'BinaryView has fewer bytes than ({FtabHeader.LENGTH:#x}) -> No complete FTAB header')
 
         header = FtabHeader(bv.read(0x0, FtabHeader.LENGTH))
         header.valid_or_raise()
@@ -190,7 +182,7 @@ class FtabTransform(Transform):
                     return entries[0].read_bytes(data)
 
                 # There's no entry to read
-                log_error(f"FTAB contains no segments")
+                log_error(f"FTAB file contains no segments")
                 return None
         except FtabError as ex:
             log_error(f"Failed to decode FTAB: {ex}")
@@ -207,7 +199,12 @@ class FtabTransform(Transform):
             log_error(f"Failed to decode FTAB: {ex}")
             return False
 
-        segment_names = [e.tag.decode('utf-8') for e in entries]
+        try:
+            segment_names = [e.tag.decode('utf-8') for e in entries]
+        except UnicodeDecodeError as ex:
+            context.transform_result = TransformResult.TransformFailure
+            log_error(f"Failed to UTF-8 decode FTAB segment names: {ex}")
+            return False
 
         # Phase 1: Discovery
         if not context.has_available_files:
@@ -239,7 +236,7 @@ class FtabTransform(Transform):
                 # attempt to detect LZFSE compressed files
                 if len(content) >= CompressedEntry.LENGTH:
                     compressed_entry = CompressedEntry(content)
-                    if compressed_entry.valid_lzfse():
+                    if compressed_entry.valid_lzfse(content):
                         context.create_child(databuffer.DataBuffer(content[CompressedEntry.LENGTH_CUT:]), name)
                         continue
 
@@ -247,7 +244,7 @@ class FtabTransform(Transform):
                 child = context.create_child(databuffer.DataBuffer(content), name)
                 child.set_transform_name("")
             except Exception as ex:
-                log_error_for_exception(f"Failed to decode FTAB with name {name}: {ex}")
+                log_error_for_exception(f"Failed to decode FTAB segment with name {name}: {ex}")
                 context.create_child(
                     databuffer.DataBuffer(b""), name,
                     result=TransformResult.TransformFailure,
