@@ -20,8 +20,9 @@ def read_err(v: Optional[T]) -> T:
         raise FtabError(f'Cannot read value of {type(v).__name__} because is None')
 
 
+@dataclass
 class FtabHeader:
-    LENGTH: int = 0x30
+    LENGTH: ClassVar[int] = 0x30
 
     unk_0: int
     unk_1: int
@@ -51,15 +52,16 @@ class FtabHeader:
         ) = struct.unpack("IIIIIIII8sII", b)
 
     def valid_or_raise(self):
-        if not self.magic != b'rkosftab':
+        if self.magic != b'rkosftab':
             raise FtabError(f'Invalid Ftab header magic')
 
-        if not self.version != 0:
+        if self.version != 0:
             raise FtabError(f'Unspported Ftab header version')
 
 
+@dataclass
 class FtabEntry:
-    LENGTH: int = 0x10
+    LENGTH: ClassVar[int] = 0x10
 
     tag: bytes
     offset: int
@@ -81,7 +83,7 @@ class FtabEntry:
         return data[self.offset: self.offset + self.length]
 
     def read_view(self, bv: BinaryView) -> bytes:
-        if self.offset + self.length < bv.length:
+        if bv.length < self.offset + self.length:
             raise FtabError(f'Cannot read FTAB segment {self.tag} as supplied data is too short')
 
         return bv.read(self.offset, self.length)
@@ -134,7 +136,7 @@ class FtabTransform(Transform):
     capabilities = TransformCapabilities.TransformSupportsDetection | TransformCapabilities.TransformSupportsContext
     name = 'ftab'
     long_name = 'Apple FTAB'
-    group = "Continer"
+    group = "Container"
 
     def can_decode(self, input: BinaryView) -> bool:
         if input.length < 0x30:
@@ -174,7 +176,7 @@ class FtabTransform(Transform):
 
     def perform_decode_with_context(self, context: TransformContext, params: dict) -> bool:
         try:
-            header, entries = FtabParser.parse_bytes(context.input.read(0, context.input.length))
+            header, entries = FtabParser.parse_view(context.input)
         except FtabError as ex:
             context.transform_result = TransformResult.TransformFailure
             log_error(f"Failed to decode FTAB: {ex}")
@@ -207,7 +209,7 @@ class FtabTransform(Transform):
                 continue
 
             try:
-                content = segments_mapping[name].read_bytes(context.input)
+                content = segments_mapping[name].read_view(context.input)
                 context.create_child(databuffer.DataBuffer(content), name)
             except Exception as ex:
                 log_error(f"Failed to decode FTAB with name {name}: {ex}")
