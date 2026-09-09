@@ -49,7 +49,7 @@ class FtabHeader:
             self.magic,
             self.segment_count,
             self.version
-        ) = struct.unpack("IIIIIIII8sII", b)
+        ) = struct.unpack("<IIIIIIII8sII", b[:self.LENGTH])
 
     def valid_or_raise(self):
         if self.magic != b'rkosftab':
@@ -87,6 +87,31 @@ class FtabEntry:
             raise FtabError(f'Cannot read FTAB segment {self.tag} as supplied data is too short')
 
         return bv.read(self.offset, self.length)
+
+
+@dataclass
+class CompressedEntry:
+    LENGTH: ClassVar[int] = 0x10
+    LENGTH_CUT: ClassVar[int] = 0xC
+
+    id: int
+    original_size: int
+    compressed_size: int
+
+    # magic is not strictly part of this header
+    magic: bytes
+
+    def __init__(self, data: bytes) -> None:
+        (
+            self.id,
+            self.original_size,
+            self.compressed_size,
+            self.magic
+        ) = struct.unpack("<III4s", data[:self.LENGTH])
+
+    def valid_lzfse(self):
+        return self.magic == b'bvx2'
+
 
 
 class FtabParser:
@@ -210,9 +235,19 @@ class FtabTransform(Transform):
 
             try:
                 content = segments_mapping[name].read_view(context.input)
-                context.create_child(databuffer.DataBuffer(content), name)
+
+                # attempt to detect LZFSE compressed files
+                if len(content) >= CompressedEntry.LENGTH:
+                    compressed_entry = CompressedEntry(content)
+                    if compressed_entry.valid_lzfse():
+                        context.create_child(databuffer.DataBuffer(content[CompressedEntry.LENGTH_CUT:]), name)
+                        continue
+
+                # prevent transformation of non-compressed files (cdpd, cdpu, l1cs, ...)
+                child = context.create_child(databuffer.DataBuffer(content), name)
+                child.set_transform_name("")
             except Exception as ex:
-                log_error(f"Failed to decode FTAB with name {name}: {ex}")
+                log_error_for_exception(f"Failed to decode FTAB with name {name}: {ex}")
                 context.create_child(
                     databuffer.DataBuffer(b""), name,
                     result=TransformResult.TransformFailure,
