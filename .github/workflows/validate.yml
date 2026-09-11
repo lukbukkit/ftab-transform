@@ -1,0 +1,26 @@
+name: Validate plugin.json
+on:
+  workflow_dispatch:
+  push:
+  pull_request:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - name: Download generate_plugininfo.py
+        run: |
+          curl --fail --silent --show-error --location \
+            --output /tmp/script.py \
+            "https://github.com/Vector35/community-plugins/raw/refs/heads/master/generate_plugininfo.py"
+
+      - name: Validate plugin.json with script
+        run: python3 /tmp/script.py -v plugin.json
