@@ -22,8 +22,6 @@
     "Linux",
     "Windows"
   ],
-  "installinstructions": {},
-  "dependencies": {},
   "version": "1.0.0",
   "author": "Lukas Arnold",
   "minimumbinaryninjaversion": 10601
